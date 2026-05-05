@@ -1,69 +1,108 @@
 mod wal;
 mod memtable;
 
-fn main() -> std::io::Result<()>
-{
-    println!("--- running basic lifecycle test ---");
+fn main() -> std::io::Result<()> {
+    // clean up old files so tests start fresh
+    let _ = std::fs::remove_file("wal.log");
+    let _ = std::fs::remove_dir_all("sst");
+
+    println!("--- 1. basic lifecycle test ---");
     test_basic_lifecycle()?;
 
-    println!("\n--- running sstable flush test ---");
+    println!("\n--- 2. sstable flush test ---");
     test_sstable_flush()?;
+
+    println!("\n--- 3. crash recovery test ---");
+    test_recovery()?;
+
+    println!("\n--- 4. ebbinghaus retention test ---");
+    test_retention_scores()?;
 
     Ok(())
 }
 
-// verifies that put, get, and delete (tombstone insertion) work in memory
 fn test_basic_lifecycle() -> std::io::Result<()>
 {
     let mut table = memtable::MemTable::new();
     let key = b"lifecycle_key";
     let value = b"lifecycle_value";
 
-    // put
     table.put(wal::RecordType::Put, key, value)?;
     if let Some(res) = table.get(key)
     {
-        println!("initial put found: {:?}", res);
+        println!("initial put found: {:?}", String::from_utf8_lossy(res));
     }
 
-    // delete
     table.delete(key)?;
     if table.get(key).is_none()
     {
         println!("key successfully deleted (tombstone works)");
     }
 
-    // put again
     table.put(wal::RecordType::Put, key, value)?;
     if let Some(res) = table.get(key)
     {
-        println!("second put found: {:?}", res);
+        println!("second put found: {:?}", String::from_utf8_lossy(res));
     }
-
     Ok(())
 }
 
-// verifies that the memtable automatically flushes to 0.sst when full
 fn test_sstable_flush() -> std::io::Result<()>
 {
-    // this test assumes you set max_size to 60 in memtable.rs
     let mut table = memtable::MemTable::new();
-    
-    let key1 = b"large_key_one_for_testing"; // ~25 bytes
-    let val1 = b"large_value_one_for_testing"; // ~27 bytes
-    // total so far: ~52 bytes (under 60)
-
+    let key1 = b"large_key_one_for_testing"; 
+    let val1 = b"large_value_one_for_testing"; 
     let key2 = b"trigger_key";
     let val2 = b"trigger_val";
-    // this second write should push us over 60 bytes and trigger the flush
 
-    println!("writing first large record");
+    println!("writing records to trigger flush");
     table.put(wal::RecordType::Put, key1, val1)?;
-    
-    println!("writing second record (triggering 0.sst creation)");
     table.put(wal::RecordType::Put, key2, val2)?;
 
-    println!("check project folder for '0.sst'");
+    println!("check 'sst/' folder for files");
+    Ok(())
+}
+
+fn test_recovery() -> std::io::Result<()>
+{
+    println!("simulating crash");
+    println!("replaying WAL");
+    let records = wal::recover_from_wal()?;
+    println!("recovered {} records from the log", records.len());
     
+    for (k, _v, t) in records
+    {
+        let type_str = if t == 0 { "PUT" } else { "DEL" };
+        println!("    - found key: {:?} (type: {})", String::from_utf8_lossy(&k), type_str);
+    }
+    Ok(())
+}
+
+fn test_retention_scores() -> std::io::Result<()>
+{
+    let mut table = memtable::MemTable::new();
+    let key_stable = b"stable_memory";
+    let key_fading = b"fading_memory";
+    
+    table.put(wal::RecordType::Put, key_stable, b"important")?;
+    table.put(wal::RecordType::Put, key_fading, b"trivial")?;
+
+    println!("rehearsing 'stable_memory' 10 times");
+    for _ in 0..10
+    {
+        let _ = table.get(key_stable);
+    }
+
+    println!("flushing to sstable");
+    table.create_sstable()?;
+
+    // pause before calculating scores to see the difference between aging memories
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let scores = table.calculate_scores()?;
+    for (key, score) in scores
+    {
+        println!("    - key: {:?}, retention strength: {:.4}", String::from_utf8_lossy(&key), score);
+    }
     Ok(())
 }

@@ -16,9 +16,10 @@ pub struct RecordHeader
     pub checksum: u32,             // CRC32 hash to detect if the data was corrupted
     pub key_length: u32,           // byte length of the key
     pub value_length: u32,         // byte length of the value
+    pub access_count: u32,         // number of times this record was read
     pub timestamp: u64,            // timestamp of this entry for "forgetting" policy
     pub record_type: RecordType,   // PUT (insert) or DELETE
-    pub padding: [u8; 3],          // 3 bytes of padding for 8 byte alignment
+    pub padding: [u8; 7],          // 7 bytes of padding for 8 byte alignment
 }
 // payload is written right after header; variable size, contains actual key and value bytes
 
@@ -45,17 +46,21 @@ pub fn append_to_wal(record_type: RecordType, key: &[u8], value: &[u8]) -> std::
         checksum: cs,
         key_length: key.len() as u32,
         value_length: value.len() as u32,
+        access_count: 1,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Time went backwards")
-            .as_secs(),
+            .as_millis()
+            .try_into()
+            .unwrap(),
         record_type: record_type,
-        padding: [0; 3],
+        padding: [0; 7],
     };
 
     wal.write_all(&header.checksum.to_le_bytes())?;
     wal.write_all(&header.key_length.to_le_bytes())?;
     wal.write_all(&header.value_length.to_le_bytes())?;
+    wal.write_all(&header.access_count.to_le_bytes())?;
     wal.write_all(&header.timestamp.to_le_bytes())?;
     wal.write_all(&(header.record_type as u8).to_le_bytes())?;
     wal.write_all(&header.padding)?;
@@ -64,7 +69,7 @@ pub fn append_to_wal(record_type: RecordType, key: &[u8], value: &[u8]) -> std::
     wal.sync_all()
 }
 
-pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>>
+pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>, u8)>>
 {
     use std::io::Read;
     use std::io::ErrorKind;
@@ -77,7 +82,7 @@ pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>>
     
     loop
     {
-        let mut header = [0u8; 24]; // 24 byte buffer to store the header
+        let mut header = [0u8; 32]; // 32 byte buffer to store the header
         match wal.read_exact(&mut header)
         {
             Ok(_) =>
@@ -85,21 +90,23 @@ pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>>
                 // get the necessary slices from the buffer
                 let key_length_bytes = &header[4..8];
                 let value_length_bytes = &header[8..12];
-                let checksum_bytes = &header[0..4];
-
+                
                 // convert the slices into 4 byte arrays
                 let key_array: [u8; 4] = key_length_bytes.try_into().expect("Key slice was wrong length");
                 let key_length = u32::from_le_bytes(key_array);
                 let value_array: [u8; 4] = value_length_bytes.try_into().expect("Value slice was wrong length");
                 let value_length = u32::from_le_bytes(value_array);
-                let checksum_array: [u8; 4] = checksum_bytes.try_into().expect("Checksum slice was wrong length");
-                let checksum = u32::from_le_bytes(checksum_array);
-
+                
                 // read the payload (which uses vec because its a dynamic size)
                 let mut key_buffer = vec![0u8; key_length as usize];
                 wal.read_exact(&mut key_buffer)?;
                 let mut value_buffer = vec![0u8; value_length as usize];
                 wal.read_exact(&mut value_buffer)?;
+
+                // get the checksum
+                let checksum_bytes = &header[0..4];
+                let checksum_array: [u8; 4] = checksum_bytes.try_into().expect("Checksum slice was wrong length");
+                let checksum = u32::from_le_bytes(checksum_array);
 
                 // check the key and value against the checksum
                 let mut hasher = crc32fast::Hasher::new();
@@ -111,8 +118,13 @@ pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>>
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Checksum mismatch"));
                 }
 
-                // add the key and value tuple to the output vector
-                records.push((key_buffer, value_buffer));
+                // get the record_type
+                let type_bytes = &header[24..25];
+                let type_array: [u8; 1] = type_bytes.try_into().expect("Record type slice was wrong length");
+                let record_type = u8::from_le_bytes(type_array);
+
+                // add the key and value (and record_type) tuple to the output vector
+                records.push((key_buffer, value_buffer, record_type));
             },
             Err(e) if e.kind() == ErrorKind::UnexpectedEof =>
             {
