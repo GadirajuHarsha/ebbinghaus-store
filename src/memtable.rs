@@ -18,7 +18,7 @@ impl MemTable // define memtable struct functions
         {
             map: BTreeMap::new(),
             current_size: 0,
-            max_size: 64,
+            max_size: 60,
         };
     }
 
@@ -38,7 +38,7 @@ impl MemTable // define memtable struct functions
         if self.current_size + key.len() + value.len() > self.max_size
         {    
             // convert the current memtable into an sstable
-            self.create_sstable();
+            self.create_sstable()?;
             
             // flush this memtable
             self.map.clear();
@@ -72,8 +72,45 @@ impl MemTable // define memtable struct functions
         self.put(crate::wal::RecordType::Delete, key, &[])
     }
 
-    pub fn create_sstable(&self)
+    pub fn create_sstable(&self) -> std::io::Result<()>
     {
-        // placeholder: create sstable of this memtable
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        
+        // open the sstable file for appends by enabling write (and creating if it doesnt exist)
+        let mut sst = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .write(true)
+            .open("0.sst")?;
+        
+        for (key, (value, record_type, timestamp, _access_count)) in self.map.iter()
+        {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(key);
+            hasher.update(value);
+            let cs = hasher.finalize();
+
+            let header = crate::wal::RecordHeader
+            {
+                checksum: cs,
+                key_length: key.len() as u32,
+                value_length: value.len() as u32,
+                timestamp: *timestamp,
+                record_type: *record_type,
+                padding: [0; 3],
+            };
+
+            sst.write_all(&header.checksum.to_le_bytes())?;
+            sst.write_all(&header.key_length.to_le_bytes())?;
+            sst.write_all(&header.value_length.to_le_bytes())?;
+            sst.write_all(&header.timestamp.to_le_bytes())?;
+            sst.write_all(&(header.record_type as u8).to_le_bytes())?;
+            sst.write_all(&header.padding)?;
+            sst.write_all(key)?;
+            sst.write_all(value)?;
+        }
+        sst.sync_all()?;
+        Ok(())
     }
 }

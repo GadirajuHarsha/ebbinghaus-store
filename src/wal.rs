@@ -11,14 +11,14 @@ pub enum RecordType
 
 #[derive(Debug, Clone)]  // stop compiler from complaining
 #[repr(C, align(8))]           // prevent the compiler from reordering the fields, 8 byte align
-pub struct WALRecordHeader
+pub struct RecordHeader
 {
-    checksum: u32,             // CRC32 hash to detect if the data was corrupted
-    key_length: u32,           // byte length of the key
-    value_length: u32,         // byte length of the value
-    timestamp: u64,            // timestamp of this entry for "forgetting" policy
-    record_type: RecordType,   // PUT (insert) or DELETE
-    padding: [u8; 3],          // 3 bytes of padding for 8 byte alignment
+    pub checksum: u32,             // CRC32 hash to detect if the data was corrupted
+    pub key_length: u32,           // byte length of the key
+    pub value_length: u32,         // byte length of the value
+    pub timestamp: u64,            // timestamp of this entry for "forgetting" policy
+    pub record_type: RecordType,   // PUT (insert) or DELETE
+    pub padding: [u8; 3],          // 3 bytes of padding for 8 byte alignment
 }
 // payload is written right after header; variable size, contains actual key and value bytes
 
@@ -40,7 +40,7 @@ pub fn append_to_wal(record_type: RecordType, key: &[u8], value: &[u8]) -> std::
     hasher.update(value);
     let cs = hasher.finalize();
 
-    let header = WALRecordHeader
+    let header = RecordHeader
     {
         checksum: cs,
         key_length: key.len() as u32,
