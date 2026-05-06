@@ -87,14 +87,10 @@ pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>, u8)>>
         {
             Ok(_) =>
             {
-                // get the necessary slices from the buffer
-                let key_length_bytes = &header[4..8];
-                let value_length_bytes = &header[8..12];
-                
-                // convert the slices into 4 byte arrays
-                let key_array: [u8; 4] = key_length_bytes.try_into().expect("Key slice was wrong length");
+                // convert the necessary slices into 4 byte arrays
+                let key_array: [u8; 4] = header[4..8].try_into().expect("Key slice was wrong length");
                 let key_length = u32::from_le_bytes(key_array);
-                let value_array: [u8; 4] = value_length_bytes.try_into().expect("Value slice was wrong length");
+                let value_array: [u8; 4] = header[8..12].try_into().expect("Value slice was wrong length");
                 let value_length = u32::from_le_bytes(value_array);
                 
                 // read the payload (which uses vec because its a dynamic size)

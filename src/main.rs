@@ -1,7 +1,8 @@
 mod wal;
 mod memtable;
 
-fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()>
+{
     // clean up old files so tests start fresh
     let _ = std::fs::remove_file("wal.log");
     let _ = std::fs::remove_dir_all("sst");
@@ -17,6 +18,9 @@ fn main() -> std::io::Result<()> {
 
     println!("\n--- 4. ebbinghaus retention test ---");
     test_retention_scores()?;
+
+    println!("\n--- 5. deep memory search test ---");
+    test_deep_search()?;
 
     Ok(())
 }
@@ -96,13 +100,38 @@ fn test_retention_scores() -> std::io::Result<()>
     println!("flushing to sstable");
     table.create_sstable()?;
 
-    // pause before calculating scores to see the difference between aging memories
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     let scores = table.calculate_scores()?;
     for (key, score) in scores
     {
         println!("    - key: {:?}, retention strength: {:.4}", String::from_utf8_lossy(&key), score);
     }
+    Ok(())
+}
+
+fn test_deep_search() -> std::io::Result<()>
+{
+    let mut table = memtable::MemTable::new();
+    let key_to_persist = b"long_term_key";
+    let value_to_persist = b"this_should_be_on_disk";
+    
+    // fill the memtable so it flushes and clears itself
+    println!("putting key into memtable");
+    table.put(wal::RecordType::Put, key_to_persist, value_to_persist)?;
+    
+    println!("triggering flush with a second large record");
+    let large_key = b"large_trigger_key_to_force_flush_and_clear_ram";
+    table.put(wal::RecordType::Put, large_key, b"ignore_me")?;
+
+    // memtable is now cleared. search disk for the first key
+    println!("memtable should be empty. searching disk for 'long_term_key'");
+    if let Some(val) = table.get(key_to_persist)
+    {
+        println!("found key on disk: {:?}", String::from_utf8_lossy(val));
+    }
+    else
+    {
+        println!("key not found on disk");
+    }
+    
     Ok(())
 }
