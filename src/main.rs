@@ -1,5 +1,6 @@
 mod wal;
 mod memtable;
+mod bloom;
 
 fn main() -> std::io::Result<()>
 {
@@ -21,6 +22,12 @@ fn main() -> std::io::Result<()>
 
     println!("\n--- 5. deep memory search test ---");
     test_deep_search()?;
+
+    println!("\n--- 6. bloom filter test ---");
+    test_bloom_filter()?;
+
+    println!("\n--- 7. cognitive compaction test ---");
+    test_cognitive_compaction()?;
 
     Ok(())
 }
@@ -133,5 +140,65 @@ fn test_deep_search() -> std::io::Result<()>
         println!("key not found on disk");
     }
     
+    Ok(())
+}
+
+fn test_bloom_filter() -> std::io::Result<()>
+{
+    // test standalone bloom filter
+    let mut filter = bloom::BloomFilter::new(512, 3);
+    filter.insert(b"present_key");
+
+    println!("standalone bloom membership: {}", filter.contains(b"present_key"));
+    println!("standalone bloom non-membership: {}", !filter.contains(b"absent_key"));
+
+    // test bloom filter on disk alongside sstables
+    let mut table = memtable::MemTable::new();
+    table.put(wal::RecordType::Put, b"bloom_test_key", b"bloom_test_value")?;
+    table.create_sstable()?;
+
+    // searching for present key should find it
+    if let Some(val) = table.get(b"bloom_test_key")
+    {
+        println!("found bloom-filtered key: {:?}", String::from_utf8_lossy(val));
+    }
+
+    // searching for absent key will be rejected by bloom filter without sstable scan
+    if table.get(b"non_existent_bloom_key").is_none()
+    {
+        println!("non-existent key filtered out by bloom filter");
+    }
+
+    Ok(())
+}
+
+fn test_cognitive_compaction() -> std::io::Result<()>
+{
+    let mut table = memtable::MemTable::new();
+
+    // write multiple records to populate tier0
+    println!("populating tier0 sstables");
+    table.put(wal::RecordType::Put, b"merge_key_a", b"value_a_old")?;
+    table.create_sstable()?;
+
+    table.put(wal::RecordType::Put, b"merge_key_b", b"value_b")?;
+    table.create_sstable()?;
+
+    table.put(wal::RecordType::Put, b"merge_key_a", b"value_a_new")?;
+    table.create_sstable()?;
+
+    println!("compacting tier0 into tier1");
+    table.compact_tier(0)?;
+
+    // verify that tier1 contains the newest version of merged keys
+    if let Some(val) = table.get(b"merge_key_a")
+    {
+        println!("retrieved compacted key_a: {:?}", String::from_utf8_lossy(val));
+    }
+    if let Some(val) = table.get(b"merge_key_b")
+    {
+        println!("retrieved compacted key_b: {:?}", String::from_utf8_lossy(val));
+    }
+
     Ok(())
 }

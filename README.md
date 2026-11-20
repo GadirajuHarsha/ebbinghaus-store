@@ -8,14 +8,17 @@ This project integrates the **Ebbinghaus Forgetting Curve** into an LSM-Tree sto
 ---
 
 ## Current Status:
-We have completed the foundational storage layer. Currently, our engine:
+We have completed the core storage engine. Currently, our engine:
 1.  Logs every operation to a performant binary write-ahead log (WAL).
     -  Headers are 32-byte aligned with CRC32 checksums for corruption detection.
 2.  Uses a BTree-based MemTable for log_n lookup and sorted iteration.
 3.  Uses "tombstone" records to ensure deletes are persistent across storage tiers.
 4.  Implements R = e^(-t/S) to score the "importance" of every record on disk.
-5.  Tracks decay curves with millisecond-precision
-6.  Maintains the `sst/` directory for immutable sorted files (SSTable's).
+5.  Tracks decay curves with millisecond-precision.
+6.  Maintains tiered directories (`sst/tier0`, `sst/tier1`, `sst/tier2`) for persistent SSTables.
+7.  Features a persistent reverse-chronological search path with automatic memory promotion (rehearsal).
+8.  Implements **Leveled Cognitive Compaction** with a multi-way merge, de-duplicating keys and dropping forgotten memories below the oblivion threshold.
+9.  Integrates **Bloom Filters** (Kirsch-Mitzenmacher double-hashing) with in-memory caching and companion `.bloom` disk persistence to skip unnecessary disk scans.
 
 ---
 
