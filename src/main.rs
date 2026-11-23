@@ -8,14 +8,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
 {
     // check if running as a persistent grpc server daemon
     let args: Vec<String> = std::env::args().collect();
-    if args.contains(&"--server".to_string())
+    if args.iter().any(|arg| arg.starts_with("--role=")) || args.contains(&"--server".to_string())
     {
-        let port = 50051;
+        let is_follower = args.iter().any(|arg| arg == "--role=follower");
+        let port = args.iter()
+            .find(|arg| arg.starts_with("--port="))
+            .and_then(|arg| arg.strip_prefix("--port="))
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(if is_follower { 50052 } else { 50051 });
+
         let addr = format!("127.0.0.1:{}", port).parse()?;
         let engine = std::sync::Arc::new(tokio::sync::Mutex::new(memtable::MemTable::new()));
-        let service = server::StorageServer::new(engine);
 
-        println!("ebbinghaus storage engine running on {}", addr);
+        let service = if is_follower
+        {
+            println!("ebbinghaus follower node running on {}", addr);
+            server::StorageServer::new_follower(engine)
+        }
+        else
+        {
+            println!("ebbinghaus leader node running on {}", addr);
+            let s = server::StorageServer::new_leader(engine);
+            // register followers passed via --followers=url1,url2
+            if let Some(followers_arg) = args.iter().find(|arg| arg.starts_with("--followers="))
+            {
+                if let Some(urls) = followers_arg.strip_prefix("--followers=")
+                {
+                    for url in urls.split(',')
+                    {
+                        if !url.trim().is_empty()
+                        {
+                            println!("registering follower: {}", url.trim());
+                            s.add_follower(url.trim().to_string()).await?;
+                        }
+                    }
+                }
+            }
+            s
+        };
+
         tonic::transport::Server::builder()
             .add_service(server::proto::ebbinghaus_service_server::EbbinghausServiceServer::new(service))
             .serve(addr)
@@ -50,6 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
 
     println!("\n--- 8. grpc network service test ---");
     test_grpc_service().await?;
+
+    println!("\n--- 9. leader-follower replication test ---");
+    test_leader_follower_replication().await?;
 
     Ok(())
 }
@@ -286,5 +320,89 @@ async fn test_grpc_service() -> Result<(), Box<dyn std::error::Error>>
     println!("get after delete found: {}", get_after_del.into_inner().found);
 
     server_handle.abort();
+    Ok(())
+}
+
+async fn test_leader_follower_replication() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use server::proto::ebbinghaus_service_client::EbbinghausServiceClient;
+    use server::proto::ebbinghaus_service_server::EbbinghausServiceServer;
+    use server::proto::{GetRequest, PutRequest};
+
+    println!("initializing leader and follower nodes");
+
+    // 1. start follower on ephemeral port
+    let follower_engine = Arc::new(Mutex::new(memtable::MemTable::new()));
+    let follower_service = server::StorageServer::new_follower(follower_engine);
+    let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let follower_addr = follower_listener.local_addr()?;
+    let follower_incoming = tokio_stream::wrappers::TcpListenerStream::new(follower_listener);
+
+    let follower_handle = tokio::spawn(async move
+    {
+        let _ = tonic::transport::Server::builder()
+            .add_service(EbbinghausServiceServer::new(follower_service))
+            .serve_with_incoming(follower_incoming)
+            .await;
+    });
+
+    // 2. start leader on ephemeral port and register follower
+    let leader_engine = Arc::new(Mutex::new(memtable::MemTable::new()));
+    let leader_service = server::StorageServer::new_leader(leader_engine);
+    let follower_url = format!("http://{}", follower_addr);
+    leader_service.add_follower(follower_url).await?;
+
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let leader_addr = leader_listener.local_addr()?;
+    let leader_incoming = tokio_stream::wrappers::TcpListenerStream::new(leader_listener);
+
+    let leader_handle = tokio::spawn(async move
+    {
+        let _ = tonic::transport::Server::builder()
+            .add_service(EbbinghausServiceServer::new(leader_service))
+            .serve_with_incoming(leader_incoming)
+            .await;
+    });
+
+    // 3. connect client to leader and write data
+    let mut leader_client = EbbinghausServiceClient::connect(format!("http://{}", leader_addr)).await?;
+    println!("writing key 'replicated_key' to leader");
+    let put_res = leader_client.put(PutRequest
+    {
+        key: b"replicated_key".to_vec(),
+        value: b"replicated_value".to_vec(),
+    }).await?;
+    println!("leader put acknowledged: {}", put_res.into_inner().success);
+
+    // 4. wait a small moment for async network replication to propagate
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 5. connect client directly to follower and read replicated data
+    println!("querying follower directly for 'replicated_key'");
+    let mut follower_client = EbbinghausServiceClient::connect(format!("http://{}", follower_addr)).await?;
+    let get_res = follower_client.get(GetRequest
+    {
+        key: b"replicated_key".to_vec(),
+    }).await?;
+
+    let body = get_res.into_inner();
+    println!("follower read successful: {}, value: {:?}", body.found, String::from_utf8_lossy(&body.value));
+    assert!(body.found);
+    assert_eq!(body.value, b"replicated_value");
+
+    // 6. verify write rejection on follower
+    println!("verifying direct writes to follower are rejected");
+    let reject_res = follower_client.put(PutRequest
+    {
+        key: b"illegal_key".to_vec(),
+        value: b"illegal_val".to_vec(),
+    }).await;
+    println!("follower write rejected as expected: {}", reject_res.is_err());
+    assert!(reject_res.is_err());
+
+    leader_handle.abort();
+    follower_handle.abort();
     Ok(())
 }
