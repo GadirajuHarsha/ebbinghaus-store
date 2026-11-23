@@ -17,8 +17,9 @@ We have completed the core storage engine. Currently, our engine:
 5.  Tracks decay curves with millisecond-precision.
 6.  Maintains tiered directories (`sst/tier0`, `sst/tier1`, `sst/tier2`) for persistent SSTables.
 7.  Features a persistent reverse-chronological search path with automatic memory promotion (rehearsal).
-8.  Implements **Leveled Cognitive Compaction** with a multi-way merge, de-duplicating keys and dropping forgotten memories below the oblivion threshold.
+8.  Implements **Leveled Compaction** with a multi-way merge, de-duplicating keys and dropping forgotten memories below the oblivion threshold.
 9.  Integrates **Bloom Filters** (Kirsch-Mitzenmacher double-hashing) with in-memory caching and companion `.bloom` disk persistence to skip unnecessary disk scans.
+10. Exposes an asynchronous **gRPC service layer** (Tokio + Tonic) with a Protobuf contract (`proto/ebbinghaus.proto`) supporting concurrent network requests (`Get`, `Put`, `Delete`) and replication primitives.
 
 ---
 
@@ -27,11 +28,18 @@ We have completed the core storage engine. Currently, our engine:
 ### Prerequisites
 *   Rust (latest stable)
 *   Cargo
+*   Protocol Buffers (`protoc`)
 
 ### Running the Test Suite
-The engine comes with an automated test suite in `src/main.rs` that demonstrates the full lifecycle of a cognitive record.
+The engine comes with an automated 8-stage test suite in `src/main.rs` that demonstrates the full lifecycle of a record, including persistence, compaction, bloom filtering, and live gRPC network operations.
 ```bash
 cargo run
+```
+
+### Running as a gRPC Server Daemon
+You can launch the engine as a standalone network service:
+```bash
+cargo run -- --server
 ```
 
 ### Understanding the Output
@@ -42,15 +50,7 @@ cargo run
 
 ## Roadmap
 
-### Next: Persistence & Indexing
-*   **Persistent Search**: Search through SSTables on disk if a key is missing from RAM.
-*   **Manifest Management**: A system to track which `.sst` files belong to which generation.
-*   **Bloom Filters**: Speed up disk lookups by 10x using probabilistic filtering.
-
-### Later: Cognitive Compaction
-*   **Merge & Forget**: Background threads that merge SSTables and permanently delete "forgotten" data.
-*   **Tiered Movement**: Automatically moving high-strength data to NVMe and low-strength data to HDD/S3.
-
-### Later: Distributed Consensus
-*   **gRPC Layer**: Inter-node communication.
-*   **Consensus**: Implementing a simplified Raft or Paxos for data replication.
+### Current Focus: Distributed Replication & Observability
+*   **Leader-Follower Replication**: Streaming WAL updates asynchronously from leader to followers over gRPC.
+*   **Prometheus Telemetry**: Real-time histograms for read/write latencies and gauges for retention decay and memory evictions.
+*   **High-Throughput Benchmarking**: Validating sub-1ms p99 tail latency under 10k+ req/sec loads.

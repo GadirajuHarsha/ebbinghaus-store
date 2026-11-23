@@ -1,9 +1,28 @@
 mod wal;
 mod memtable;
 mod bloom;
+mod server;
 
-fn main() -> std::io::Result<()>
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>>
 {
+    // check if running as a persistent grpc server daemon
+    let args: Vec<String> = std::env::args().collect();
+    if args.contains(&"--server".to_string())
+    {
+        let port = 50051;
+        let addr = format!("127.0.0.1:{}", port).parse()?;
+        let engine = std::sync::Arc::new(tokio::sync::Mutex::new(memtable::MemTable::new()));
+        let service = server::StorageServer::new(engine);
+
+        println!("ebbinghaus storage engine running on {}", addr);
+        tonic::transport::Server::builder()
+            .add_service(server::proto::ebbinghaus_service_server::EbbinghausServiceServer::new(service))
+            .serve(addr)
+            .await?;
+        return Ok(());
+    }
+
     // clean up old files so tests start fresh
     let _ = std::fs::remove_file("wal.log");
     let _ = std::fs::remove_dir_all("sst");
@@ -26,8 +45,11 @@ fn main() -> std::io::Result<()>
     println!("\n--- 6. bloom filter test ---");
     test_bloom_filter()?;
 
-    println!("\n--- 7. cognitive compaction test ---");
-    test_cognitive_compaction()?;
+    println!("\n--- 7. compaction test ---");
+    test_compaction()?;
+
+    println!("\n--- 8. grpc network service test ---");
+    test_grpc_service().await?;
 
     Ok(())
 }
@@ -172,7 +194,7 @@ fn test_bloom_filter() -> std::io::Result<()>
     Ok(())
 }
 
-fn test_cognitive_compaction() -> std::io::Result<()>
+fn test_compaction() -> std::io::Result<()>
 {
     let mut table = memtable::MemTable::new();
 
@@ -200,5 +222,69 @@ fn test_cognitive_compaction() -> std::io::Result<()>
         println!("retrieved compacted key_b: {:?}", String::from_utf8_lossy(val));
     }
 
+    Ok(())
+}
+
+async fn test_grpc_service() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use server::proto::ebbinghaus_service_client::EbbinghausServiceClient;
+    use server::proto::ebbinghaus_service_server::EbbinghausServiceServer;
+    use server::proto::{GetRequest, PutRequest, DeleteRequest};
+
+    let engine = Arc::new(Mutex::new(memtable::MemTable::new()));
+    let service = server::StorageServer::new(engine);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    // spawn grpc server in background with pre-bound listener
+    let server_handle = tokio::spawn(async move
+    {
+        let _ = tonic::transport::Server::builder()
+            .add_service(EbbinghausServiceServer::new(service))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // connect client over async channel
+    let client_addr = format!("http://{}", addr);
+    let mut client = EbbinghausServiceClient::connect(client_addr).await?;
+
+    // test put over grpc
+    println!("putting key over grpc");
+    let put_res = client.put(PutRequest
+    {
+        key: b"network_key".to_vec(),
+        value: b"network_value".to_vec(),
+    }).await?;
+    println!("put acknowledged: {}", put_res.into_inner().success);
+
+    // test get over grpc
+    println!("getting key over grpc");
+    let get_res = client.get(GetRequest
+    {
+        key: b"network_key".to_vec(),
+    }).await?;
+    let body = get_res.into_inner();
+    println!("get found: {}, value: {:?}", body.found, String::from_utf8_lossy(&body.value));
+
+    // test delete over grpc
+    println!("deleting key over grpc");
+    let del_res = client.delete(DeleteRequest
+    {
+        key: b"network_key".to_vec(),
+    }).await?;
+    println!("delete acknowledged: {}", del_res.into_inner().success);
+
+    // verify key is now absent
+    let get_after_del = client.get(GetRequest
+    {
+        key: b"network_key".to_vec(),
+    }).await?;
+    println!("get after delete found: {}", get_after_del.into_inner().found);
+
+    server_handle.abort();
     Ok(())
 }
