@@ -1,51 +1,22 @@
 # Ebbinghaus: Distributed KV Storage Engine
 
-High-performance distributed storage engine in Rust featuring an LSM-tree architecture, exponential time-decay compaction, asynchronous gRPC services, and leader-follower replication.
+Thanks for stopping by to check out my project!
 
-Built in Rust, Tokio, Tonic (gRPC), Prost, and Serde.
+I built Ebbinghaus Store in Rust to explore distributed systems and address an architectural challenge I found interesting: what happens when you take a classical Log-Structured Merge-tree (LSM-tree) and replace traditional LRU/LFU eviction with Hermann Ebbinghaus's exponential forgetting curve, a psychological model of memory decay?
 
----
+$$R = e^{-t / S}$$
 
-## Overview
+In this engine, every read query acts as a rehearsal event that resets the decay timer and boosts stability $S$. Frequently queried keys stay firmly anchored in fast working memory, while unused keys quietly decay and are permanently evicted during background leveled compaction passes.
 
-In traditional storage engines, data eviction and caching rely on generic algorithms like LRU (Least Recently Used) or LFU (Least Frequently Used). I designed Ebbinghaus Store to solve the problem of storing and retrieving high-volume contextual information (such as AI context buffers and conversational memory) where items lose relevance over time unless explicitly rehearsed or retrieved.
-
-The storage engine implements an LSM-tree (Log-Structured Merge-tree) where records are scored using Hermann Ebbinghaus's exponential forgetting curve:
-
-R = e^(-t / S)
-
-Every read query acts as a rehearsal event, resetting the decay timer and boosting the record's stability factor S. During background leveled compaction passes, records whose retention score falls below a set oblivion threshold are permanently evicted, keeping active working memory lean while preserving high-frequency data.
+Built from scratch in Rust using Tokio, Tonic (gRPC), Prost, and Prometheus.
 
 ---
 
-## Architectural Deep Dive
+## Architecture & Deep Dive
 
-If you are looking for an in-depth breakdown of the internal subsystems, binary layout, leveled compaction merge loops, and network protocol design, please refer to the dedicated architecture guide:
+I wrote a comprehensive, standalone architecture guide complete with interactive Mermaid diagrams covering the mathematical foundation, 32-byte aligned binary WAL specifications, K-way compaction merge loops, Bloom filter hashing, distributed consensus, and Prometheus observability!
 
-**Read the full technical specification in [ARCHITECTURE.md](file:///Users/harsha/Documents/Projects/ebbinghaus-store/ARCHITECTURE.md)**
-
-The architecture document covers:
-* The motivation and mathematical foundation of access-weighted exponential decay.
-* A primer on core concepts for newcomers: LSM-trees, WAL, Bloom filters, Tokio, and gRPC.
-* Complete binary specification of the 32-byte aligned WAL and SSTable headers with CRC32 checksums.
-* Multi-tier leveled compaction (Tier 0 to Tier 2) with de-duplication and lowest-tier eviction.
-* Kirsch-Mitzenmacher double-hashed Bloom filters for zero-I/O absent key rejections.
-* Asynchronous gRPC service layer and thread-safe concurrency model.
-* Leader-follower replication and non-blocking background synchronization.
-* Prometheus metrics collection for tail latency histograms and decay monitoring.
-
----
-
-## Core Technical Features
-
-* **High-Throughput Write Path**: Append-only binary write-ahead logging with 32-byte aligned headers and CRC32 payload verification.
-* **Lexicographical In-Memory Indexing**: BTreeMap-backed MemTable synchronized with an asynchronous Mutex to handle concurrent reads and mutations.
-* **Persistent Reverse-Chronological Search**: Multi-tier SSTable search path that automatically promotes retrieved disk records back into working memory.
-* **Zero-I/O Bloom Filtering**: Space-efficient Bloom filters cached in RAM and persisted to disk alongside SSTables, avoiding disk seeks for absent keys.
-* **Leveled Compaction & Time-Decay Eviction**: Background K-way merge across sorted files that de-duplicates shadowed keys and drops records below the oblivion threshold.
-* **Asynchronous gRPC Interface**: Strongly-typed network service defined in Protocol Buffers and served over HTTP/2 using Tonic and Tokio.
-* **Distributed Leader-Follower Replication**: Non-blocking async mutation streaming from leader to follower nodes, with follower write-protection and localized read scaling.
-* **Prometheus Observability**: Latency histograms (p50, p95, p99) and decay/eviction counters exposed via standard metrics endpoints.
+**For all deep-dive technical and architectural details, please see [ARCHITECTURE.md](https://github.com/GadirajuHarsha/ebbinghaus-store/blob/main/ARCHITECTURE.md)**.
 
 ---
 
@@ -61,27 +32,36 @@ The architecture document covers:
 brew install protobuf
 ```
 
-### Running the End-to-End Test Suite
-I have built an automated 9-stage verification suite in `src/main.rs` that validates the entire engine lifecycle: basic CRUD, SSTable flushing, crash recovery replay, retention score decay, deep disk retrieval, Bloom filter filtering, multi-way compaction, gRPC client-server operations, and leader-follower replication:
+### Running the Test Suite
+I built an automated 10-stage test suite in `src/main.rs` that validates the entire engine lifecycle: basic CRUD, SSTable flushes, WAL crash recovery replay, retention score decay, deep disk retrieval, Bloom filters, leveled compaction, gRPC networking, leader-follower replication, and Prometheus metrics export with rehearsal synchronization:
 
 ```bash
 cargo run
 ```
 
-To run unit tests (Bloom filter bitsets and serialization):
+To run the unit tests (Bloom filter bitsets and serialization):
 ```bash
 cargo test
 ```
 
 ### Running Distributed Nodes
-You can launch nodes in specific cluster roles:
+You can also launch cluster nodes locally in specific roles:
 
 ```bash
-# 1. start a follower node on port 50052
-cargo run -- --role=follower --port=50052
+# 1. start a follower node on port 50052 (with metrics on 9091)
+cargo run -- --role=follower --port=50052 --metrics-port=9091 --leader=http://127.0.0.1:50051
 
-# 2. start a leader node on port 50051 that replicates to the follower
-cargo run -- --role=leader --port=50051 --followers=http://127.0.0.1:50052
+# 2. start a leader node on port 50051 that replicates to the follower (with metrics on 9090)
+cargo run -- --role=leader --port=50051 --metrics-port=9090 --followers=http://127.0.0.1:50052
+```
+
+To scrape Prometheus metrics:
+```bash
+curl http://127.0.0.1:9090/metrics
 ```
 
 ---
+
+## Thanks for Visiting!
+
+Building this engine was an amazing learning experience in systems programming, concurrency, and distributed systems. If you have any questions or feedback while exploring the code, feel free to reach out or dive into [ARCHITECTURE.md](https://github.com/GadirajuHarsha/ebbinghaus-store/blob/main/ARCHITECTURE.md)!

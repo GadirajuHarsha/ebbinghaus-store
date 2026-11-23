@@ -15,6 +15,7 @@ use proto::{
     DeleteRequest, DeleteResponse,
     ReplicateRequest, ReplicateResponse,
     ReplicationRecord, RecordOp,
+    RehearsalRecord, RehearsalBatch, RehearsalAck,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,29 +33,55 @@ pub struct StorageServer
     role: NodeRole,
     // follower channels for async replication from leader
     followers: Arc<Mutex<Vec<EbbinghausServiceClient<Channel>>>>,
+    // prometheus metrics collector for latency and request tracking
+    metrics: Arc<crate::metrics::MetricsRegistry>,
+    // in-memory buffer on follower to aggregate rehearsal counts before sync to leader
+    rehearsal_buffer: Arc<Mutex<Vec<RehearsalRecord>>>,
 }
 
 impl StorageServer
 {
-    // initialize as a leader node
+    // initialize as a leader node with default metrics registry
     pub fn new_leader(engine: Arc<Mutex<crate::memtable::MemTable>>) -> Self
+    {
+        Self::new_leader_with_metrics(engine, Arc::new(crate::metrics::MetricsRegistry::new()))
+    }
+
+    // initialize as a leader node with explicit metrics registry
+    pub fn new_leader_with_metrics(
+        engine: Arc<Mutex<crate::memtable::MemTable>>,
+        metrics: Arc<crate::metrics::MetricsRegistry>,
+    ) -> Self
     {
         StorageServer
         {
             engine,
             role: NodeRole::Leader,
             followers: Arc::new(Mutex::new(Vec::new())),
+            metrics,
+            rehearsal_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    // initialize as a follower node
+    // initialize as a follower node with default metrics registry
     pub fn new_follower(engine: Arc<Mutex<crate::memtable::MemTable>>) -> Self
+    {
+        Self::new_follower_with_metrics(engine, Arc::new(crate::metrics::MetricsRegistry::new()))
+    }
+
+    // initialize as a follower node with explicit metrics registry
+    pub fn new_follower_with_metrics(
+        engine: Arc<Mutex<crate::memtable::MemTable>>,
+        metrics: Arc<crate::metrics::MetricsRegistry>,
+    ) -> Self
     {
         StorageServer
         {
             engine,
             role: NodeRole::Follower,
             followers: Arc::new(Mutex::new(Vec::new())),
+            metrics,
+            rehearsal_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -62,6 +89,12 @@ impl StorageServer
     pub fn new(engine: Arc<Mutex<crate::memtable::MemTable>>) -> Self
     {
         Self::new_leader(engine)
+    }
+
+    // accessor for metrics registry
+    pub fn get_metrics(&self) -> Arc<crate::metrics::MetricsRegistry>
+    {
+        self.metrics.clone()
     }
 
     // register a follower node for async replication
@@ -75,6 +108,29 @@ impl StorageServer
         followers.push(client);
         Ok(())
     }
+
+    // sync buffered read rehearsals on follower back to leader node
+    pub async fn sync_rehearsals_to_leader(&self, leader_addr: &str) -> Result<bool, Box<dyn std::error::Error>>
+    {
+        let batch: Vec<RehearsalRecord> =
+        {
+            let mut buf = self.rehearsal_buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+
+        if batch.is_empty()
+        {
+            return Ok(true);
+        }
+
+        let mut client = EbbinghausServiceClient::connect(leader_addr.to_string()).await?;
+        let response = client.sync_rehearsal(RehearsalBatch
+        {
+            rehearsals: batch,
+        }).await?;
+
+        Ok(response.into_inner().acknowledged)
+    }
 }
 
 #[tonic::async_trait]
@@ -83,21 +139,49 @@ impl EbbinghausService for StorageServer
     // retrieve a value by key (triggers rehearsal and promotion)
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status>
     {
+        let timer = self.metrics.request_duration.with_label_values(&["get"]).start_timer();
         let req = request.into_inner();
         let mut engine = self.engine.lock().await;
 
-        match engine.get(&req.key)
+        let result = engine.get(&req.key).cloned();
+        match result
         {
             Some(val) =>
             {
+                self.metrics.requests_total.with_label_values(&["get", "hit"]).inc();
+                self.metrics.memtable_bytes.set(engine.get_current_size() as i64);
+                let score = engine.average_retention_score();
+                self.metrics.average_retention_score.set(score);
+
+                // buffer rehearsal on follower to sync back to leader later
+                if self.role == NodeRole::Follower
+                {
+                    let mut buf = self.rehearsal_buffer.lock().await;
+                    if let Some(record) = buf.iter_mut().find(|r| r.key == req.key)
+                    {
+                        record.access_count_delta += 1;
+                    }
+                    else
+                    {
+                        buf.push(RehearsalRecord
+                        {
+                            key: req.key.clone(),
+                            access_count_delta: 1,
+                        });
+                    }
+                }
+
+                drop(timer);
                 Ok(Response::new(GetResponse
                 {
                     found: true,
-                    value: val.clone(),
+                    value: val,
                 }))
             },
             None =>
             {
+                self.metrics.requests_total.with_label_values(&["get", "miss"]).inc();
+                drop(timer);
                 Ok(Response::new(GetResponse
                 {
                     found: false,
@@ -110,8 +194,11 @@ impl EbbinghausService for StorageServer
     // write a key-value pair to the engine
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status>
     {
+        let timer = self.metrics.request_duration.with_label_values(&["put"]).start_timer();
         if self.role == NodeRole::Follower
         {
+            self.metrics.requests_total.with_label_values(&["put", "rejected"]).inc();
+            drop(timer);
             return Err(Status::failed_precondition("cannot write directly to follower node"));
         }
 
@@ -122,6 +209,16 @@ impl EbbinghausService for StorageServer
         {
             Ok(_) =>
             {
+                self.metrics.requests_total.with_label_values(&["put", "success"]).inc();
+                self.metrics.memtable_bytes.set(engine.get_current_size() as i64);
+                if engine.evicted_count > 0
+                {
+                    self.metrics.evictions_total.with_label_values(&["retention_decay"]).inc_by(engine.evicted_count as u64);
+                    engine.evicted_count = 0;
+                }
+                let score = engine.average_retention_score();
+                self.metrics.average_retention_score.set(score);
+
                 // asynchronously replicate to followers
                 if self.role == NodeRole::Leader
                 {
@@ -148,6 +245,7 @@ impl EbbinghausService for StorageServer
                     });
                 }
 
+                drop(timer);
                 Ok(Response::new(PutResponse
                 {
                     success: true,
@@ -155,6 +253,8 @@ impl EbbinghausService for StorageServer
             },
             Err(e) =>
             {
+                self.metrics.requests_total.with_label_values(&["put", "error"]).inc();
+                drop(timer);
                 Err(Status::internal(e.to_string()))
             },
         }
@@ -163,8 +263,11 @@ impl EbbinghausService for StorageServer
     // insert a tombstone record to delete a key
     async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status>
     {
+        let timer = self.metrics.request_duration.with_label_values(&["delete"]).start_timer();
         if self.role == NodeRole::Follower
         {
+            self.metrics.requests_total.with_label_values(&["delete", "rejected"]).inc();
+            drop(timer);
             return Err(Status::failed_precondition("cannot write directly to follower node"));
         }
 
@@ -175,6 +278,14 @@ impl EbbinghausService for StorageServer
         {
             Ok(_) =>
             {
+                self.metrics.requests_total.with_label_values(&["delete", "success"]).inc();
+                self.metrics.memtable_bytes.set(engine.get_current_size() as i64);
+                if engine.evicted_count > 0
+                {
+                    self.metrics.evictions_total.with_label_values(&["retention_decay"]).inc_by(engine.evicted_count as u64);
+                    engine.evicted_count = 0;
+                }
+
                 // asynchronously replicate tombstone to followers
                 if self.role == NodeRole::Leader
                 {
@@ -201,6 +312,7 @@ impl EbbinghausService for StorageServer
                     });
                 }
 
+                drop(timer);
                 Ok(Response::new(DeleteResponse
                 {
                     success: true,
@@ -208,6 +320,8 @@ impl EbbinghausService for StorageServer
             },
             Err(e) =>
             {
+                self.metrics.requests_total.with_label_values(&["delete", "error"]).inc();
+                drop(timer);
                 Err(Status::internal(e.to_string()))
             },
         }
@@ -216,6 +330,7 @@ impl EbbinghausService for StorageServer
     // handle batch replication from leader to follower
     async fn replicate(&self, request: Request<ReplicateRequest>) -> Result<Response<ReplicateResponse>, Status>
     {
+        let timer = self.metrics.request_duration.with_label_values(&["replicate"]).start_timer();
         let req = request.into_inner();
         let mut engine = self.engine.lock().await;
 
@@ -227,6 +342,8 @@ impl EbbinghausService for StorageServer
                 {
                     if let Err(e) = engine.put(crate::wal::RecordType::Put, &record.key, &record.value)
                     {
+                        self.metrics.requests_total.with_label_values(&["replicate", "error"]).inc();
+                        drop(timer);
                         return Err(Status::internal(e.to_string()));
                     }
                 },
@@ -234,13 +351,40 @@ impl EbbinghausService for StorageServer
                 {
                     if let Err(e) = engine.delete(&record.key)
                     {
+                        self.metrics.requests_total.with_label_values(&["replicate", "error"]).inc();
+                        drop(timer);
                         return Err(Status::internal(e.to_string()));
                     }
                 },
             }
         }
 
+        self.metrics.requests_total.with_label_values(&["replicate", "success"]).inc();
+        self.metrics.memtable_bytes.set(engine.get_current_size() as i64);
+        drop(timer);
+
         Ok(Response::new(ReplicateResponse
+        {
+            acknowledged: true,
+        }))
+    }
+
+    // sync rehearsal access counts from followers to leader to eliminate decay skew
+    async fn sync_rehearsal(&self, request: Request<RehearsalBatch>) -> Result<Response<RehearsalAck>, Status>
+    {
+        let timer = self.metrics.request_duration.with_label_values(&["sync_rehearsal"]).start_timer();
+        let req = request.into_inner();
+        let mut engine = self.engine.lock().await;
+
+        for item in req.rehearsals
+        {
+            engine.record_rehearsal(&item.key, item.access_count_delta);
+        }
+
+        self.metrics.requests_total.with_label_values(&["sync_rehearsal", "success"]).inc();
+        drop(timer);
+
+        Ok(Response::new(RehearsalAck
         {
             acknowledged: true,
         }))

@@ -12,6 +12,7 @@ dashmap = "6.0"
 crc32fast = "1.5.0"
 tonic = "0.12"
 prost = "0.13"
+prometheus = "0.13"
 
 [build-dependencies]
 tonic-build = "0.12"

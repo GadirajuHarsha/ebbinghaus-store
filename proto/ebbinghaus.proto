@@ -16,6 +16,9 @@ service EbbinghausService
 
     // replicate a batch of operations from leader to follower
     rpc Replicate (ReplicateRequest) returns (ReplicateResponse);
+
+    // sync read access rehearsal counts from followers back to the leader
+    rpc SyncRehearsal (RehearsalBatch) returns (RehearsalAck);
 }
 
 message GetRequest
@@ -71,6 +74,22 @@ message ReplicateRequest
 }
 
 message ReplicateResponse
+{
+    bool acknowledged = 1;
+}
+
+message RehearsalRecord
+{
+    bytes key = 1;
+    uint32 access_count_delta = 2;
+}
+
+message RehearsalBatch
+{
+    repeated RehearsalRecord rehearsals = 1;
+}
+
+message RehearsalAck
 {
     bool acknowledged = 1;
 }

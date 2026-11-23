@@ -2,6 +2,7 @@ mod wal;
 mod memtable;
 mod bloom;
 mod server;
+mod metrics;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>
@@ -23,7 +24,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
         let service = if is_follower
         {
             println!("ebbinghaus follower node running on {}", addr);
-            server::StorageServer::new_follower(engine)
+            let follower_service = server::StorageServer::new_follower(engine);
+
+            // if leader url is provided, start background task to periodically flush rehearsals
+            if let Some(leader_arg) = args.iter().find(|arg| arg.starts_with("--leader="))
+            {
+                if let Some(leader_url) = leader_arg.strip_prefix("--leader=")
+                {
+                    let leader_addr = leader_url.to_string();
+                    let follower_srv = follower_service.clone();
+                    tokio::spawn(async move
+                    {
+                        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+                        loop
+                        {
+                            interval.tick().await;
+                            let _ = follower_srv.sync_rehearsals_to_leader(&leader_addr).await;
+                        }
+                    });
+                }
+            }
+
+            follower_service
         }
         else
         {
@@ -46,6 +68,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
             }
             s
         };
+
+        // start prometheus metrics http server
+        let metrics_port = args.iter()
+            .find(|arg| arg.starts_with("--metrics-port="))
+            .and_then(|arg| arg.strip_prefix("--metrics-port="))
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(if is_follower { 9091 } else { 9090 });
+
+        let metrics_addr: std::net::SocketAddr = format!("127.0.0.1:{}", metrics_port).parse()?;
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+        println!("ebbinghaus prometheus metrics server running on {}", metrics_addr);
+        let metrics_registry = service.get_metrics();
+        tokio::spawn(async move
+        {
+            let _ = metrics::start_metrics_server(metrics_listener, metrics_registry).await;
+        });
 
         tonic::transport::Server::builder()
             .add_service(server::proto::ebbinghaus_service_server::EbbinghausServiceServer::new(service))
@@ -84,6 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
 
     println!("\n--- 9. leader-follower replication test ---");
     test_leader_follower_replication().await?;
+
+    println!("\n--- 10. metrics and rehearsal synchronization test ---");
+    test_metrics_and_rehearsal_synchronization().await?;
 
     Ok(())
 }
@@ -404,5 +445,141 @@ async fn test_leader_follower_replication() -> Result<(), Box<dyn std::error::Er
 
     leader_handle.abort();
     follower_handle.abort();
+    Ok(())
+}
+
+async fn test_metrics_and_rehearsal_synchronization() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use server::proto::ebbinghaus_service_client::EbbinghausServiceClient;
+    use server::proto::ebbinghaus_service_server::EbbinghausServiceServer;
+    use server::proto::{GetRequest, PutRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    println!("initializing leader and follower with metrics registry");
+
+    let leader_metrics = Arc::new(metrics::MetricsRegistry::new());
+    let leader_engine = Arc::new(Mutex::new(memtable::MemTable::new()));
+    let leader_service = server::StorageServer::new_leader_with_metrics(leader_engine.clone(), leader_metrics.clone());
+
+    let follower_metrics = Arc::new(metrics::MetricsRegistry::new());
+    let follower_engine = Arc::new(Mutex::new(memtable::MemTable::new()));
+    let follower_service = server::StorageServer::new_follower_with_metrics(follower_engine.clone(), follower_metrics.clone());
+
+    // 1. bind follower on ephemeral port
+    let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let follower_addr = follower_listener.local_addr()?;
+    let follower_incoming = tokio_stream::wrappers::TcpListenerStream::new(follower_listener);
+
+    let follower_service_clone = follower_service.clone();
+    let follower_handle = tokio::spawn(async move
+    {
+        let _ = tonic::transport::Server::builder()
+            .add_service(EbbinghausServiceServer::new(follower_service_clone))
+            .serve_with_incoming(follower_incoming)
+            .await;
+    });
+
+    // 2. register follower with leader
+    let follower_url = format!("http://{}", follower_addr);
+    leader_service.add_follower(follower_url).await?;
+
+    // 3. bind leader on ephemeral port
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let leader_addr = leader_listener.local_addr()?;
+    let leader_incoming = tokio_stream::wrappers::TcpListenerStream::new(leader_listener);
+
+    let leader_service_clone = leader_service.clone();
+    let leader_handle = tokio::spawn(async move
+    {
+        let _ = tonic::transport::Server::builder()
+            .add_service(EbbinghausServiceServer::new(leader_service_clone))
+            .serve_with_incoming(leader_incoming)
+            .await;
+    });
+
+    // 4. start metrics http server on ephemeral port
+    let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let metrics_addr = metrics_listener.local_addr()?;
+    let leader_metrics_clone = leader_metrics.clone();
+    let metrics_handle = tokio::spawn(async move
+    {
+        let _ = metrics::start_metrics_server(metrics_listener, leader_metrics_clone).await;
+    });
+
+    // 5. write key to leader
+    let mut leader_client = EbbinghausServiceClient::connect(format!("http://{}", leader_addr)).await?;
+    let put_res = leader_client.put(PutRequest
+    {
+        key: b"telemetry_key".to_vec(),
+        value: b"telemetry_val".to_vec(),
+    }).await?;
+    assert!(put_res.into_inner().success);
+    println!("wrote telemetry_key to leader");
+
+    // wait for async replication to follower
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 6. perform 3 reads on follower to buffer rehearsals
+    let mut follower_client = EbbinghausServiceClient::connect(format!("http://{}", follower_addr)).await?;
+    for _ in 0..3
+    {
+        let get_res = follower_client.get(GetRequest
+        {
+            key: b"telemetry_key".to_vec(),
+        }).await?;
+        assert!(get_res.into_inner().found);
+    }
+    println!("performed 3 reads on follower (buffered in follower rehearsal queue)");
+
+    // 7. scrape prometheus /metrics endpoint over tcp
+    let mut stream = tokio::net::TcpStream::connect(metrics_addr).await?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop
+    {
+        let n = stream.read(&mut buf).await?;
+        if n == 0
+        {
+            break;
+        }
+        resp.extend_from_slice(&buf[..n]);
+    }
+    let body = String::from_utf8_lossy(&resp);
+    println!("scraped /metrics endpoint ({} bytes)", body.len());
+    assert!(body.contains("ebbinghaus_requests_total"));
+    assert!(body.contains("ebbinghaus_request_duration_seconds"));
+    assert!(body.contains("op=\"put\""));
+    println!("verified prometheus metrics output contains request counters and latency histograms");
+
+    // 8. verify leader access count before synchronization
+    let count_before =
+    {
+        let engine = leader_engine.lock().await;
+        engine.get_access_count(b"telemetry_key").unwrap_or(0)
+    };
+    println!("leader access count before sync: {}", count_before);
+    assert_eq!(count_before, 1);
+
+    // 9. sync follower rehearsals to leader
+    println!("flushing rehearsal buffer from follower to leader");
+    let sync_ack = follower_service.sync_rehearsals_to_leader(&format!("http://{}", leader_addr)).await?;
+    assert!(sync_ack);
+
+    // 10. verify leader access count after synchronization
+    let count_after =
+    {
+        let engine = leader_engine.lock().await;
+        engine.get_access_count(b"telemetry_key").unwrap_or(0)
+    };
+    println!("leader access count after rehearsal sync: {}", count_after);
+    assert_eq!(count_after, 4);
+    println!("rehearsal sync successfully eliminated decay skew between nodes");
+
+    leader_handle.abort();
+    follower_handle.abort();
+    metrics_handle.abort();
     Ok(())
 }

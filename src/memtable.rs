@@ -10,6 +10,7 @@ pub struct MemTable
     current_size: usize,
     max_size: usize,
     bloom_filters: HashMap<PathBuf, crate::bloom::BloomFilter>,
+    pub evicted_count: usize,
 }
 
 impl MemTable // define memtable struct functions
@@ -23,7 +24,71 @@ impl MemTable // define memtable struct functions
             current_size: 0,
             max_size: 60,
             bloom_filters: HashMap::new(),
+            evicted_count: 0,
         };
+    }
+
+    // record an external rehearsal delta from replica telemetry
+    pub fn record_rehearsal(&mut self, key: &[u8], delta: u32)
+    {
+        let now = self.get_timestamp();
+        if !self.map.contains_key(key)
+        {
+            // promote from disk if present
+            let _ = self.search_sstables(key);
+            if delta > 1
+            {
+                if let Some(record) = self.map.get_mut(key)
+                {
+                    record.3 += delta - 1;
+                    record.2 = now;
+                }
+            }
+        }
+        else if let Some(record) = self.map.get_mut(key)
+        {
+            record.3 += delta;
+            record.2 = now;
+        }
+    }
+
+    // calculate average retention score for active in-memory records
+    pub fn average_retention_score(&self) -> f64
+    {
+        if self.map.is_empty()
+        {
+            return 1.0;
+        }
+        let mut total = 0.0;
+        let mut count = 0;
+        for (_k, (_v, record_type, timestamp, access_count)) in self.map.iter()
+        {
+            if *record_type != crate::wal::RecordType::Delete
+            {
+                total += self.retention_strength(*timestamp, *access_count);
+                count += 1;
+            }
+        }
+        if count == 0
+        {
+            1.0
+        }
+        else
+        {
+            total / count as f64
+        }
+    }
+
+    // get the current memory footprint of records
+    pub fn get_current_size(&self) -> usize
+    {
+        self.current_size
+    }
+
+    // get access count of a key in working memory
+    pub fn get_access_count(&self, key: &[u8]) -> Option<u32>
+    {
+        self.map.get(key).map(|record| record.3)
     }
 
     // helper to get current timestamp
@@ -38,7 +103,7 @@ impl MemTable // define memtable struct functions
     }
 
     // helper to calculate retention strength of a single record
-    fn retention_strength(&mut self, timestamp: u64, access_count: u32) -> f64
+    fn retention_strength(&self, timestamp: u64, access_count: u32) -> f64
     {
         let forgetting_constant = 2500;
         let s = (forgetting_constant * access_count).max(1) as f64;
@@ -608,11 +673,13 @@ impl MemTable // define memtable struct functions
                 if winner_type == crate::wal::RecordType::Delete
                 {
                     should_write = false;
+                    self.evicted_count += 1;
                 }
                 // drop forgotten records below retention threshold
                 else if self.retention_strength(winner_ts, winner_access) < 0.10
                 {
                     should_write = false;
+                    self.evicted_count += 1;
                 }
             }
 

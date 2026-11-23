@@ -1,4 +1,4 @@
-# Architecture Guide: Ebbinghaus Storage Engine
+# Architecture Guide
 
 Hello, thanks for coming to read more about my project! I really enjoyed the process of designing and implementing it, so I hope that this breakdown helps you better understand it :)
 
@@ -8,11 +8,13 @@ I built this project to explore what happens when you take the classical Log-Str
 
 ## 1. Motivation and Conceptual Background
 
-In standard storage engines, cache eviction and data cleanup typically follow simple heuristics like Least Recently Used (LRU) or Least Frequently Used (LFU). While those policies work well for uniform workloads, they fall short in modern applications like AI context storage and agentic scratchpads. In those systems, hundreds of intermediate facts are written once and never read again, while a handful of critical instructions are repeatedly queried.
+I have always been fascinated by how human memory works, especially how effortlessly our brains let trivial daily details fade away while keeping concepts we revisit frequently crystal clear! 
+
+In contrast, traditional storage engines treat all stored bytes identically: cache eviction and data cleanup typically follow blunt heuristics like Least Recently Used (LRU) or Least Frequently Used (LFU). While those policies work well for uniform workloads, they fall short in modern applications like AI context storage and agentic scratchpads. In those systems, hundreds of intermediate facts are written once and never read again, while a handful of critical instructions are repeatedly queried. That got me wondering: what if a storage engine handled data retention more like a natural memory system?
 
 I drew inspiration from Hermann Ebbinghaus's empirical model of human memory decay. In his model, the retention strength of information decreases exponentially over time according to:
 
-R = e^(-t / S)
+$$R = e^{-t / S}$$
 
 Where:
 * R is retention strength (scaled between 0.0 and 1.0).
@@ -179,6 +181,8 @@ flowchart TD
 
 ## 4. Deep Dive: The Core Subsystems
 
+Let's take a deep dive into each component of the engine to see how they work under the hood, from the exact byte layout on disk to the background compaction loops and network protocols.
+
 ### 4.1 Write-Ahead Log (WAL) and Binary Protocol
 
 Durability is guaranteed by appending every mutation to `wal.log` before updating in-memory state. I designed a custom binary format aligned to 8-byte boundaries to maximize read and write performance:
@@ -281,7 +285,7 @@ The engine exposes its storage operations over gRPC using Tonic and Protocol Buf
 
 Clients interact with the engine using high-performance HTTP/2 multiplexing, enabling concurrent access from multiple processes or microservices.
 
-### 4.7 Leader-Follower Replication and Node Synchronization
+### 4.7 Distributed Consensus, Replication, and Node Synchronization
 
 To support distributed scaling, the engine implements a Leader-Follower architecture:
 
@@ -316,7 +320,7 @@ The engine exposes an HTTP endpoint on port 9090 (`/metrics`) formatted for Prom
 
 ## 5. Performance and Latency Goals
 
-I designed this engine to hit demanding operational targets:
+When building this engine, I set some ambitious performance targets for myself to make sure all the retention math and background checks would not get in the way of high-throughput operations:
 
 * **Throughput**: Sustained 10,000+ requests per second under concurrent multi-threaded load.
 * **Read Tail Latency**: Sub-1 millisecond p99 latency for hot keys residing in working memory or covered by Bloom filters.
@@ -340,6 +344,7 @@ ebbinghaus-store/
 │   ├── wal.rs               # Binary WAL format, append logging, and crash recovery
 │   ├── memtable.rs          # MemTable, decay math, search path, and compaction
 │   ├── bloom.rs             # Bloom filter double-hashing and disk serialization
+│   ├── metrics.rs           # Prometheus metrics registry and HTTP export endpoint
 │   └── server.rs            # Asynchronous gRPC service and leader-follower replication
 └── sst/                     # Data storage directory (ignored by git)
     ├── tier0/               # Fresh SSTables flushed from MemTable
@@ -349,7 +354,11 @@ ebbinghaus-store/
 
 ---
 
-## 7. Summary
+## 7. Summary and Reflections
 
-By combining the structural efficiency of an LSM-tree with mathematical retention scoring, this engine delivers high write throughput, predictable memory footprint, and low tail latencies. If you have questions or want to dive deeper into any specific module, feel free to explore the corresponding files linked above!
+Building this engine from scratch in Rust has been an incredible journey! Designing the binary WAL layout, implementing the K-way compaction merge loops, and working through the distributed rehearsal synchronization taught me so much about building reliable, concurrent systems.
+
+By combining the structural efficiency of an LSM-tree with mathematical retention scoring, this engine achieves high write throughput, predictable memory footprint, and sub-millisecond tail latencies.
+
+Thank you so much for taking the time to read through my architecture breakdown! If you want to explore the implementation in more detail, check out the source files linked above, or hop back to the [README.md](https://github.com/GadirajuHarsha/ebbinghaus-store) to run the test suite and launch the cluster nodes locally. I hope you enjoy exploring the code as much as I enjoyed writing it!
 
