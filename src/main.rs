@@ -1,14 +1,17 @@
-mod wal;
-mod memtable;
-mod bloom;
-mod server;
-mod metrics;
+use ebbinghaus_store::{wal, memtable, bloom, server, metrics, bench};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>
 {
-    // check if running as a persistent grpc server daemon
     let args: Vec<String> = std::env::args().collect();
+
+    // check if running the benchmark harness
+    if args.contains(&"--bench".to_string()) || args.contains(&"--benchmark".to_string())
+    {
+        return bench::run_benchmark(&args).await;
+    }
+
+    // check if running as a persistent grpc server daemon
     if args.iter().any(|arg| arg.starts_with("--role=")) || args.contains(&"--server".to_string())
     {
         let is_follower = args.iter().any(|arg| arg == "--role=follower");
@@ -18,13 +21,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(if is_follower { 50052 } else { 50051 });
 
+        let memtable_bytes = args.iter()
+            .find(|arg| arg.starts_with("--memtable-size="))
+            .and_then(|arg| arg.strip_prefix("--memtable-size="))
+            .and_then(|p| p.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+
         let addr = format!("127.0.0.1:{}", port).parse()?;
-        let engine = std::sync::Arc::new(tokio::sync::Mutex::new(memtable::MemTable::new()));
+        let engine = std::sync::Arc::new(tokio::sync::Mutex::new(memtable::MemTable::with_capacity(memtable_bytes)));
 
         let service = if is_follower
         {
             println!("ebbinghaus follower node running on {}", addr);
-            let follower_service = server::StorageServer::new_follower(engine);
+            let follower_service = server::StorageServer::new_follower(engine.clone());
 
             // if leader url is provided, start background task to periodically flush rehearsals
             if let Some(leader_arg) = args.iter().find(|arg| arg.starts_with("--leader="))
@@ -50,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
         else
         {
             println!("ebbinghaus leader node running on {}", addr);
-            let s = server::StorageServer::new_leader(engine);
+            let s = server::StorageServer::new_leader(engine.clone());
             // register followers passed via --followers=url1,url2
             if let Some(followers_arg) = args.iter().find(|arg| arg.starts_with("--followers="))
             {
@@ -85,9 +94,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
             let _ = metrics::start_metrics_server(metrics_listener, metrics_registry).await;
         });
 
+        let engine_clone = engine.clone();
         tonic::transport::Server::builder()
             .add_service(server::proto::ebbinghaus_service_server::EbbinghausServiceServer::new(service))
-            .serve(addr)
+            .serve_with_shutdown(addr, async move
+            {
+                tokio::signal::ctrl_c().await.ok();
+                println!("shutting down node gracefully");
+                let mut table = engine_clone.lock().await;
+                if let Err(e) = table.flush()
+                {
+                    eprintln!("error flushing memtable on shutdown: {}", e);
+                }
+                else
+                {
+                    println!("flushed active working memory to disk");
+                }
+            })
             .await?;
         return Ok(());
     }

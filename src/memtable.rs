@@ -15,17 +15,23 @@ pub struct MemTable
 
 impl MemTable // define memtable struct functions
 {
-    // create a new memtable
+    // create a new memtable with default test capacity
     pub fn new() -> Self
     {
-        return MemTable
+        Self::with_capacity(60)
+    }
+
+    // create a memtable with a custom byte capacity
+    pub fn with_capacity(max_size: usize) -> Self
+    {
+        MemTable
         {
             map: BTreeMap::new(),
             current_size: 0,
-            max_size: 60,
+            max_size,
             bloom_filters: HashMap::new(),
             evicted_count: 0,
-        };
+        }
     }
 
     // record an external rehearsal delta from replica telemetry
@@ -59,13 +65,17 @@ impl MemTable // define memtable struct functions
         {
             return 1.0;
         }
+        let now = self.get_timestamp();
         let mut total = 0.0;
         let mut count = 0;
         for (_k, (_v, record_type, timestamp, access_count)) in self.map.iter()
         {
             if *record_type != crate::wal::RecordType::Delete
             {
-                total += self.retention_strength(*timestamp, *access_count);
+                let forgetting_constant = 2500;
+                let s = (forgetting_constant * access_count).max(1) as f64;
+                let t = (now.saturating_sub(*timestamp)) as f64;
+                total += (-(t / s)).exp();
                 count += 1;
             }
         }
@@ -205,6 +215,19 @@ impl MemTable // define memtable struct functions
         let timestamp = self.get_timestamp();
         self.map.insert(key.to_vec(), (value.to_vec(), record_type, timestamp, access_count));
         self.current_size += key.len() + value.len();
+        Ok(())
+    }
+
+    // flush active memtable to sstable and clean up working memory on shutdown
+    pub fn flush(&mut self) -> std::io::Result<()>
+    {
+        if self.current_size > 0
+        {
+            self.create_sstable()?;
+            self.map.clear();
+            self.current_size = 0;
+            let _ = std::fs::remove_file("wal.log");
+        }
         Ok(())
     }
 

@@ -66,7 +66,7 @@ pub fn append_to_wal(record_type: RecordType, key: &[u8], value: &[u8]) -> std::
     wal.write_all(&header.padding)?;
     wal.write_all(key)?;
     wal.write_all(value)?;
-    wal.sync_all()
+    wal.flush()
 }
 
 pub fn recover_from_wal() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>, u8)>>

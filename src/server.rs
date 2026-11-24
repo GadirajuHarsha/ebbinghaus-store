@@ -133,6 +133,8 @@ impl StorageServer
     }
 }
 
+static SAMPLE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[tonic::async_trait]
 impl EbbinghausService for StorageServer
 {
@@ -150,8 +152,13 @@ impl EbbinghausService for StorageServer
             {
                 self.metrics.requests_total.with_label_values(&["get", "hit"]).inc();
                 self.metrics.memtable_bytes.set(engine.get_current_size() as i64);
-                let score = engine.average_retention_score();
-                self.metrics.average_retention_score.set(score);
+
+                // sample retention score calculation periodically to avoid per-read lock contention
+                if SAMPLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0
+                {
+                    let score = engine.average_retention_score();
+                    self.metrics.average_retention_score.set(score);
+                }
 
                 // buffer rehearsal on follower to sync back to leader later
                 if self.role == NodeRole::Follower
@@ -216,8 +223,12 @@ impl EbbinghausService for StorageServer
                     self.metrics.evictions_total.with_label_values(&["retention_decay"]).inc_by(engine.evicted_count as u64);
                     engine.evicted_count = 0;
                 }
-                let score = engine.average_retention_score();
-                self.metrics.average_retention_score.set(score);
+                // sample retention score calculation periodically to avoid per-write lock contention
+                if SAMPLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0
+                {
+                    let score = engine.average_retention_score();
+                    self.metrics.average_retention_score.set(score);
+                }
 
                 // asynchronously replicate to followers
                 if self.role == NodeRole::Leader
